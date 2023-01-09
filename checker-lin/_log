@@ -1,0 +1,13 @@
+==13357== Memcheck, a memory error detector
+==13357== Copyright (C) 2002-2017, and GNU GPL'd, by Julian Seward et al.
+==13357== Using Valgrind-3.15.0 and LibVEX; rerun with -h for copyright info
+==13357== Command: ./aws
+==13357== Parent PID: 13355
+==13357== 
+==13357== Syscall param epoll_ctl(event) points to uninitialised byte(s)
+==13357==    at 0x497FAFE: epoll_ctl (syscall-template.S:78)
+==13357==    by 0x10A5D8: w_epoll_add_fd_in (w_epoll.h:30)
+==13357==    by 0x10B640: main (aws.c:336)
+==13357==  Address 0x1ffeffff74 is on thread 1's stack
+==13357==  in frame #1, created by w_epoll_add_fd_in (w_epoll.h:24)
+==13357== 
