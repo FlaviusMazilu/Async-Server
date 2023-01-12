@@ -22,6 +22,9 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <libaio.h>
+#include <sys/eventfd.h>
+#include <sys/sendfile.h>
 
 #include "util.h"
 #include "debug.h"
@@ -42,6 +45,11 @@ static int listenfd;
 /* epoll file descriptor */
 static int epollfd;
 
+enum fileType {
+	STATIC,
+	DYNAMIC,
+	INVALID
+};
 enum connection_state {
 	STATE_DATA_RECEIVED,
 	STATE_DATA_SENT,
@@ -80,7 +88,11 @@ struct connection {
 	char send_buffer[BUFSIZ];
 	size_t send_len;
 	enum connection_state state;
+	enum fileType fileType;
 	char path_requested[MAX_LENGTH_PATH];
+	
+	int eventfd;
+	io_context_t ctx;
 };
 
 /*
@@ -97,6 +109,9 @@ static struct connection *connection_create(int sockfd)
 	memset(conn->recv_buffer, 0, BUFSIZ);
 	memset(conn->send_buffer, 0, BUFSIZ);
 	memset(conn->path_requested, 0, MAX_LENGTH_PATH);
+
+	conn->eventfd = -1;
+	conn->ctx = NULL;
 	return conn;
 }
 
@@ -216,8 +231,18 @@ static enum connection_state receive_message(struct connection *conn)
 		return STATE_DATA_RECEIVED;
 	}
 	// file doesn't exist
+	char reply[BUFSIZ] = "HTTP/1.0 404 ERROR\r\n\r\n";
+	int bytes_sent = 0;
+
+	aux = 0;
+	do {
+		aux += bytes_sent;
+		bytes_sent = send(conn->sockfd, reply + aux, strlen(reply) + 1, 0);
+	}while (bytes_sent > 0);
+
 	fprintf(f_out, "file doesn't exist\n");
 	fflush(f_out);
+
 remove_connection:
 	rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
 	DIE(rc < 0, "w_epoll_remove_ptr");
@@ -241,20 +266,95 @@ remove_connection:
 // 	http_parser_execute(&http_reply, &settings, NULL, NULL);
 	
 // }
-static enum connection_state send_message(struct connection *conn)
+// static enum connection_state send_sendfile(struct connection *conn)
+// {
+
+// }
+
+static enum connection_state send_message_sendfile(struct connection *conn)
 {
 	ssize_t bytes_sent;
 	int rc;
 	char abuffer[64];
-	char reply[BUFSIZ];
-	snprintf(reply, conn->send_len + 1, "HTTP/1.0 200 OK\r\nContent-Length: %ld\r\nConnection: close\r\n\r\n", conn->send_len); 
+	char reply[BUFSIZ] = "HTTP/1.0 200 OK\r\n\r\n";
 	rc = get_peer_address(conn->sockfd, abuffer, 64);
 	if (rc < 0) {
 		ERR("get_peer_address");
 		goto remove_connection;
 	}
-	send(conn->sockfd, reply, strlen(reply),0);
-	bytes_sent = send(conn->sockfd, conn->send_buffer, conn->send_len, 0);
+	
+	int aux = 0;
+	do {
+		aux += bytes_sent;
+		bytes_sent = send(conn->sockfd, reply + aux, strlen(reply) + 1 - aux, 0);
+	} while (bytes_sent > 0);
+
+	struct stat stat;
+	int fd = open(conn->path_requested, O_RDONLY);
+	DIE (fd < 0, "open");
+	
+	fstat(fd, &stat);
+	rc = sendfile(conn->sockfd, fd, NULL, stat.st_size);
+	DIE (rc < 0, "sendfile");
+	bytes_sent = rc + aux;
+
+	if (bytes_sent < 0) {		/* error in communication */
+		dlog(LOG_ERR, "Error in communication to %s\n", abuffer);
+		goto remove_connection;
+	}
+	if (bytes_sent == 0) {		/* connection closed */
+		dlog(LOG_INFO, "Connection closed to %s\n", abuffer);
+		goto remove_connection;
+	}
+
+	dlog(LOG_DEBUG, "Sending message to %s\n", abuffer);
+
+	// printf("--\n%s--\n", conn->send_buffer);
+
+	/* all done - remove out notification */
+	close(fd);
+	rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
+	DIE(rc < 0, "w_epoll_update_ptr_in");
+	connection_remove(conn);
+
+	return STATE_DATA_SENT;
+remove_connection:
+	rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
+	DIE(rc < 0, "w_epoll_remove_ptr");
+
+	/* remove current connection */
+	connection_remove(conn);
+	close(fd);
+	return STATE_CONNECTION_CLOSED;
+}
+
+static enum connection_state send_message(struct connection *conn)
+{
+	if (conn->fileType == STATIC) {
+		return send_message_sendfile(conn);
+	}
+	ssize_t bytes_sent;
+	int rc;
+	char abuffer[64];
+	char reply[BUFSIZ] = "HTTP/1.0 200 OK\r\n\r\n";
+	rc = get_peer_address(conn->sockfd, abuffer, 64);
+	if (rc < 0) {
+		ERR("get_peer_address");
+		goto remove_connection;
+	}
+	int aux = 0;
+	do {
+		aux += bytes_sent;
+		bytes_sent = send(conn->sockfd, reply + aux, strlen(reply) + 1 - aux, 0);
+	} while (bytes_sent > 0);
+	bytes_sent = 0;
+
+	do {
+		aux += bytes_sent;
+		bytes_sent = send(conn->sockfd, conn->send_buffer + aux, conn->send_len - aux, 0);
+		
+	} while (bytes_sent > 0);
+	bytes_sent = aux;
 	if (bytes_sent < 0) {		/* error in communication */
 		dlog(LOG_ERR, "Error in communication to %s\n", abuffer);
 		goto remove_connection;
@@ -288,11 +388,6 @@ remove_connection:
  * Handle a client request on a client connection.
  */
 
-enum fileType {
-	STATIC,
-	DYNAMIC,
-	INVALID
-};
 
 enum fileType get_fileType(char *buffer)
 {
@@ -325,8 +420,11 @@ static void handle_client_request(struct connection *conn)
 	/* add socket to epoll for out events */
 	// conn->send_buffer, move here
 	enum fileType f = get_fileType(conn->path_requested);
-	
-	get_file_in_mem(conn);
+	conn->fileType = f;
+
+	if (conn->fileType == DYNAMIC) {
+		get_file_in_mem(conn);
+	}
 	// connection_copy_buffers(conn);
 	rc = w_epoll_update_ptr_out(epollfd, conn->sockfd, conn);
 	DIE(rc < 0, "w_epoll_add_ptr_inout");
