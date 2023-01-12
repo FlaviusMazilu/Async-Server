@@ -93,6 +93,8 @@ struct connection {
 	
 	int eventfd;
 	io_context_t ctx;
+	struct iocb *iocb;
+	int file_fd;
 };
 
 /*
@@ -177,7 +179,7 @@ void parse_path_request(struct connection *conn)
 
 	memcpy(conn->path_requested, AWS_DOCUMENT_ROOT, strlen(AWS_DOCUMENT_ROOT));
 	memcpy(conn->path_requested + strlen(AWS_DOCUMENT_ROOT), request_path, strlen(request_path) + 1);
-	fprintf(f_out, "path= %s\n", conn->path_requested);
+	// fprintf(f_out, "path= %s\n", conn->path_requested);
 	fflush(f_out);
 }
 
@@ -193,19 +195,19 @@ static enum connection_state receive_message(struct connection *conn)
 		goto remove_connection;
 	}
 	int aux = 0;
-	fprintf(f_out, "before recv\n");
+	// fprintf(f_out, "before recv\n");
 	do {
 		aux += bytes_recv;
 		if (strstr(conn->recv_buffer, "\r\n\r\n") != NULL)
 			break;
 		bytes_recv = recv(conn->sockfd, conn->recv_buffer + aux, BUFSIZ - aux, 0);
-		fprintf(f_out, "->>>>>%s\n", conn->recv_buffer);
+		// fprintf(f_out, "->>>>>%s\n", conn->recv_buffer);
 	} while (bytes_recv > 0);
 	bytes_recv = aux;
-	fprintf(f_out, "<<<<%ld\n", bytes_recv);
+	// fprintf(f_out, "<<<<%ld\n", bytes_recv);
 	if (bytes_recv < 0) {		/* error in communication */
 		dlog(LOG_ERR, "Error in communication from: %s\n", abuffer);
-		fprintf(f_out, "Error in communication from: %s\n", abuffer);
+		// fprintf(f_out, "Error in communication from: %s\n", abuffer);
 		goto remove_connection;
 	}
 	// if (bytes_recv == 0) {		/* connection closed */
@@ -215,18 +217,17 @@ static enum connection_state receive_message(struct connection *conn)
 	// }
 
 	dlog(LOG_DEBUG, "Received message from: %s\n", abuffer);
-	fprintf(f_out, "Received message from: %s\n", abuffer);
+	// fprintf(f_out, "Received message from: %s\n", abuffer);
 
-	fprintf(f_out, "--\n%s--\n", conn->recv_buffer);
-	fflush(f_out);
+	// fprintf(f_out, "--\n%s--\n", conn->recv_buffer);
+
 	conn->recv_len = bytes_recv;
 
 	// TODO handle http request-> extract path
 	parse_path_request(conn);
 	if (access(conn->path_requested, F_OK) == 0) {
     	// file exists
-		fprintf(f_out, "file exists\n");
-		fflush(f_out);
+		// fprintf(f_out, "file exists\n");
 		conn->state = STATE_DATA_RECEIVED;
 		return STATE_DATA_RECEIVED;
 	}
@@ -240,8 +241,7 @@ static enum connection_state receive_message(struct connection *conn)
 		bytes_sent = send(conn->sockfd, reply + aux, strlen(reply) + 1, 0);
 	}while (bytes_sent > 0);
 
-	fprintf(f_out, "file doesn't exist\n");
-	fflush(f_out);
+	// fprintf(f_out, "file doesn't exist\n");
 
 remove_connection:
 	rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
@@ -286,17 +286,27 @@ static enum connection_state send_message_sendfile(struct connection *conn)
 	int aux = 0;
 	do {
 		aux += bytes_sent;
-		bytes_sent = send(conn->sockfd, reply + aux, strlen(reply) + 1 - aux, 0);
+		bytes_sent = send(conn->sockfd, reply + aux, strlen(reply) - aux, 0);
 	} while (bytes_sent > 0);
 
 	struct stat stat;
 	int fd = open(conn->path_requested, O_RDONLY);
 	DIE (fd < 0, "open");
-	
+
 	fstat(fd, &stat);
-	rc = sendfile(conn->sockfd, fd, NULL, stat.st_size);
+	fprintf(f_out, "conn->send_len = %ld\n", stat.st_size);
+	fflush(f_out);
+	aux = 0;
+	off_t offset = 0;
+	bytes_sent = 0;
+	do {
+		aux += bytes_sent;
+		bytes_sent = sendfile(conn->sockfd, fd, &offset, stat.st_size - offset);
+
+	} while (bytes_sent > 0);
+	
 	DIE (rc < 0, "sendfile");
-	bytes_sent = rc + aux;
+	bytes_sent = aux;
 
 	if (bytes_sent < 0) {		/* error in communication */
 		dlog(LOG_ERR, "Error in communication to %s\n", abuffer);
@@ -342,13 +352,14 @@ static enum connection_state send_message(struct connection *conn)
 		ERR("get_peer_address");
 		goto remove_connection;
 	}
+	
 	int aux = 0;
 	do {
 		aux += bytes_sent;
-		bytes_sent = send(conn->sockfd, reply + aux, strlen(reply) + 1 - aux, 0);
+		bytes_sent = send(conn->sockfd, reply + aux, strlen(reply) - aux, 0);
 	} while (bytes_sent > 0);
 	bytes_sent = 0;
-
+	aux = 0;
 	do {
 		aux += bytes_sent;
 		bytes_sent = send(conn->sockfd, conn->send_buffer + aux, conn->send_len - aux, 0);
@@ -400,13 +411,34 @@ enum fileType get_fileType(char *buffer)
 
 void get_file_in_mem(struct connection *conn)
 {
+	conn->eventfd = eventfd(0, 0);
+	DIE(conn->eventfd < 0, "eventfd fail");
+
+	int rc = io_setup(1, &conn->ctx);
+	DIE (rc < 0, "io setup fail");
+
 	int fd = open(conn->path_requested, O_RDONLY);
 	DIE(fd < 0, "die fopen");
 
-	int bytes = read(fd, conn->send_buffer, BUFSIZ);
-	DIE(bytes < 0, "eroare de comunicare");
+	conn->iocb = malloc(sizeof(struct iocb));
+	DIE (conn->iocb == NULL, "malloc");
 
-	conn->send_len = bytes;
+	// int bytes = read(fd, conn->send_buffer, BUFSIZ);
+	// struct iocb 
+	// io_prep_pread()
+	// DIE(bytes < 0, "eroare de comunicare");
+	struct stat stat;
+	fstat(fd, &stat);
+	conn->send_len = stat.st_size;
+
+	io_prep_pread(conn->iocb, fd, conn->send_buffer, BUFSIZ, 0);
+	io_set_eventfd(conn->iocb, conn->eventfd);
+
+	// w_epoll_add_fd_in(epollfd, conn->eventfd);
+	io_submit(conn->ctx, 1, &conn->iocb);
+	struct io_event revent;
+	io_getevents(conn->ctx, 1, 1, &revent, NULL);
+	//TODO CLOSE fd, event and all
 	close(fd);
 }
 static void handle_client_request(struct connection *conn)
@@ -438,10 +470,10 @@ int main(void)
 		printf("aici NU e problema\n");
 	DIE(f_out == NULL, "fopen");
 
-	char buffer[100];
-	getcwd(buffer, sizeof(buffer));
-	fprintf(f_out, "%s\n", buffer);
-	fflush(f_out);
+	// char buffer[100];
+	// getcwd(buffer, sizeof(buffer));
+	// fprintf(f_out, "%s\n", buffer);
+	// fflush(f_out);
 	/* init multiplexing */
 	epollfd = w_epoll_create();
 	DIE(epollfd < 0, "w_epoll_create");
@@ -472,27 +504,27 @@ int main(void)
 
 		if (rev.data.fd == listenfd) {
 			dlog(LOG_DEBUG, "New connection\n");
-			fprintf(f_out, "new connection\n");
-			fflush(f_out);
+			// fprintf(f_out, "new connection\n");
+			// fflush(f_out);
 			if (rev.events & EPOLLIN)
 				handle_new_connection();
 		} else {
 			if (rev.events & EPOLLIN) {
 				dlog(LOG_DEBUG, "New message\n");
-				fprintf(f_out, "new message\n");
-				fflush(f_out);
+				// fprintf(f_out, "new message\n");
+				// fflush(f_out);
 				handle_client_request(rev.data.ptr);
 			}
 			if (rev.events & EPOLLOUT) {
 				dlog(LOG_DEBUG, "Ready to send message\n");
-				fprintf(f_out, "ready to send message\n");
-				fflush(f_out);
+				// fprintf(f_out, "ready to send message\n");
+				// fflush(f_out);
 				send_message(rev.data.ptr);
-				fprintf(f_out, "message sent\n");
+				// fprintf(f_out, "message sent\n");
 			}
 		}
 	}
-	fprintf(f_out, ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
+	// fprintf(f_out, ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
 	fclose(f_out);
 	return 0;
 }
