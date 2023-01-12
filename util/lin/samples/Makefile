@@ -1,4 +1,4 @@
-CPPFLAGS = -DDEBUG -DLOG_LEVEL=LOG_DEBUG -I. -I.. -I../..
+CPPFLAGS = -DDEBUG -DLOG_LEVEL=LOG_DEBUG -I. -I.. -I../.. -laio
 CFLAGS = -Wall -g
 
 .PHONY: all clean
@@ -22,3 +22,14 @@ clean:
 	-rm -f ../sock_util.o
 	-rm -f ../../http-parser/http_parser.o
 	-rm -f aws
+
+run_baby:
+	gcc aws.c -c aws.o -I../.. -I. -I..
+	gcc aws.o ../sock_util.o ../../http-parser/http_parser.o -laio -o aws
+	
+cp:
+	cp aws ../../../checker-lin
+	cp aws ../../../checker-lin/_test
+
+check:
+	./run.sh

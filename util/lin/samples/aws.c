@@ -21,6 +21,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <errno.h>
 
 #include "util.h"
 #include "debug.h"
@@ -32,6 +33,8 @@
 #define ECHO_LISTEN_PORT AWS_LISTEN_PORT
 static char request_path[BUFSIZ];	/* storage for request_path */
 static http_parser request_parser;
+
+FILE *f_out;
 
 /* server socket file descriptor */
 static int listenfd;
@@ -101,11 +104,11 @@ static struct connection *connection_create(int sockfd)
  * Copy receive buffer to send buffer (echo).
  */
 
-static void connection_copy_buffers(struct connection *conn)
-{
-	conn->send_len = conn->recv_len;
-	memcpy(conn->send_buffer, conn->recv_buffer, conn->send_len);
-}
+// static void connection_copy_buffers(struct connection *conn)
+// {
+// 	conn->send_len = conn->recv_len;
+// 	memcpy(conn->send_buffer, conn->recv_buffer, conn->send_len);
+// }
 
 /*
  * Remove connection handler.
@@ -156,14 +159,16 @@ void parse_path_request(struct connection *conn)
 	http_parser_init(&request_parser, HTTP_REQUEST);
 	int rc = http_parser_execute(&request_parser, &http_settings, conn->recv_buffer, conn->recv_len);
 	DIE(rc < 0, "http parser request path");
+
 	memcpy(conn->path_requested, AWS_DOCUMENT_ROOT, strlen(AWS_DOCUMENT_ROOT));
 	memcpy(conn->path_requested + strlen(AWS_DOCUMENT_ROOT), request_path, strlen(request_path) + 1);
-	printf("path= %s\n", conn->path_requested);
+	fprintf(f_out, "path= %s\n", conn->path_requested);
+	fflush(f_out);
 }
 
 static enum connection_state receive_message(struct connection *conn)
 {
-	ssize_t bytes_recv;
+	ssize_t bytes_recv = 0;
 	int rc;
 	char abuffer[64];
 
@@ -172,30 +177,47 @@ static enum connection_state receive_message(struct connection *conn)
 		ERR("get_peer_address");
 		goto remove_connection;
 	}
-
-	bytes_recv = recv(conn->sockfd, conn->recv_buffer, BUFSIZ, 0);
+	int aux = 0;
+	fprintf(f_out, "before recv\n");
+	do {
+		aux += bytes_recv;
+		if (strstr(conn->recv_buffer, "\r\n\r\n") != NULL)
+			break;
+		bytes_recv = recv(conn->sockfd, conn->recv_buffer + aux, BUFSIZ - aux, 0);
+		fprintf(f_out, "->>>>>%s\n", conn->recv_buffer);
+	} while (bytes_recv > 0);
+	bytes_recv = aux;
+	fprintf(f_out, "<<<<%ld\n", bytes_recv);
 	if (bytes_recv < 0) {		/* error in communication */
 		dlog(LOG_ERR, "Error in communication from: %s\n", abuffer);
+		fprintf(f_out, "Error in communication from: %s\n", abuffer);
 		goto remove_connection;
 	}
-	if (bytes_recv == 0) {		/* connection closed */
-		dlog(LOG_INFO, "Connection closed from: %s\n", abuffer);
-		goto remove_connection;
-	}
+	// if (bytes_recv == 0) {		/* connection closed */
+		// dlog(LOG_INFO, "Connection closed from: %s\n", abuffer);
+		// fprintf(f_out, "Connection closed from: %s\n", abuffer);
+		// goto remove_connection;
+	// }
 
 	dlog(LOG_DEBUG, "Received message from: %s\n", abuffer);
+	fprintf(f_out, "Received message from: %s\n", abuffer);
 
-	printf("--\n%s--\n", conn->recv_buffer);
+	fprintf(f_out, "--\n%s--\n", conn->recv_buffer);
+	fflush(f_out);
 	conn->recv_len = bytes_recv;
 
 	// TODO handle http request-> extract path
 	parse_path_request(conn);
 	if (access(conn->path_requested, F_OK) == 0) {
     	// file exists
+		fprintf(f_out, "file exists\n");
+		fflush(f_out);
 		conn->state = STATE_DATA_RECEIVED;
 		return STATE_DATA_RECEIVED;
 	}
 	// file doesn't exist
+	fprintf(f_out, "file doesn't exist\n");
+	fflush(f_out);
 remove_connection:
 	rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
 	DIE(rc < 0, "w_epoll_remove_ptr");
@@ -224,16 +246,8 @@ static enum connection_state send_message(struct connection *conn)
 	ssize_t bytes_sent;
 	int rc;
 	char abuffer[64];
-	char reply[BUFSIZ] = "HTTP/1.0 200 OK\r\n"
-		"Date: Sun, 08 May 2011 09:26:16 GMT\r\n"
-		"Server: Apache/2.2.9\r\n"
-		"Last-Modified: Mon, 02 Aug 2010 17:55:28 GMT\r\n"
-		"Accept-Ranges: bytes\r\n"
-		"Content-Length: 2048\r\n"
-		"Vary: Accept-Encoding\r\n"
-		"Connection: close\r\n"
-		"Content-Type: text/html\r\n"
-		"\r\n";
+	char reply[BUFSIZ];
+	snprintf(reply, conn->send_len + 1, "HTTP/1.0 200 OK\r\nContent-Length: %ld\r\nConnection: close\r\n\r\n", conn->send_len); 
 	rc = get_peer_address(conn->sockfd, abuffer, 64);
 	if (rc < 0) {
 		ERR("get_peer_address");
@@ -255,13 +269,11 @@ static enum connection_state send_message(struct connection *conn)
 	// printf("--\n%s--\n", conn->send_buffer);
 
 	/* all done - remove out notification */
-	rc = w_epoll_update_ptr_in(epollfd, conn->sockfd, conn);
+	rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
 	DIE(rc < 0, "w_epoll_update_ptr_in");
-
-	conn->state = STATE_DATA_SENT;
+	connection_remove(conn);
 
 	return STATE_DATA_SENT;
-
 remove_connection:
 	rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
 	DIE(rc < 0, "w_epoll_remove_ptr");
@@ -316,14 +328,22 @@ static void handle_client_request(struct connection *conn)
 	
 	get_file_in_mem(conn);
 	// connection_copy_buffers(conn);
-	rc = w_epoll_update_ptr_inout(epollfd, conn->sockfd, conn);
+	rc = w_epoll_update_ptr_out(epollfd, conn->sockfd, conn);
 	DIE(rc < 0, "w_epoll_add_ptr_inout");
 }
 
 int main(void)
 {
 	int rc;
+	f_out = fopen("plswork.txt", "a");
+	if (f_out != NULL)
+		printf("aici NU e problema\n");
+	DIE(f_out == NULL, "fopen");
 
+	char buffer[100];
+	getcwd(buffer, sizeof(buffer));
+	fprintf(f_out, "%s\n", buffer);
+	fflush(f_out);
 	/* init multiplexing */
 	epollfd = w_epoll_create();
 	DIE(epollfd < 0, "w_epoll_create");
@@ -354,19 +374,27 @@ int main(void)
 
 		if (rev.data.fd == listenfd) {
 			dlog(LOG_DEBUG, "New connection\n");
+			fprintf(f_out, "new connection\n");
+			fflush(f_out);
 			if (rev.events & EPOLLIN)
 				handle_new_connection();
 		} else {
 			if (rev.events & EPOLLIN) {
 				dlog(LOG_DEBUG, "New message\n");
+				fprintf(f_out, "new message\n");
+				fflush(f_out);
 				handle_client_request(rev.data.ptr);
 			}
 			if (rev.events & EPOLLOUT) {
 				dlog(LOG_DEBUG, "Ready to send message\n");
+				fprintf(f_out, "ready to send message\n");
+				fflush(f_out);
 				send_message(rev.data.ptr);
+				fprintf(f_out, "message sent\n");
 			}
 		}
 	}
-
+	fprintf(f_out, ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
+	fclose(f_out);
 	return 0;
 }
