@@ -36,7 +36,7 @@
 #define ECHO_LISTEN_PORT AWS_LISTEN_PORT
 static char request_path[BUFSIZ];	/* storage for request_path */
 static http_parser request_parser;
-static struct connection *connections[10];
+static struct connection *connections[100];
 static int active_cons = 0;
 void get_file_in_mem(struct connection *conn);
 
@@ -457,7 +457,7 @@ static enum connection_state send_message_event_sig(struct connection *conn)
 	if (conn->offset < conn->size) {
 	// 	// it means the buffer went full before reading the full file
 	// 	// put it to read the rest async and notify when ready
-		dlog(LOG_DEBUG, "== BUFSIZ, get again get file in mem\n");
+		// dlog(LOG_DEBUG, "== BUFSIZ, get again get file in mem\n");
 		conn->aux_del = 50;
 		get_file_in_mem(conn);
 		return STATE_DATA_SENDING;
