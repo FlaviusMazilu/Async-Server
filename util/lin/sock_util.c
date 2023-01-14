@@ -40,7 +40,7 @@
  * Connect to a TCP server identified by name (DNS name or dotted decimal
  * string) and port.
  */
-static void set_nonblocking(int fd) {
+void set_nonblocking(int fd) {
   int flags = fcntl(fd, F_GETFL, 0);
   if (flags == -1) {
     perror("fcntl()");
