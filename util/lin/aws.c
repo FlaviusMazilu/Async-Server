@@ -91,6 +91,7 @@ struct connection {
 	char send_buffer[BUFSIZ];
 	size_t send_len;
 	enum connection_state state;
+
 	enum fileType fileType;
 	char path_requested[MAX_LENGTH_PATH];
 	
@@ -123,14 +124,12 @@ static struct connection *connection_create(int sockfd)
 	conn->offset = 0;
 	conn->ctx = malloc(sizeof(io_context_t));
     int rc = io_setup(3, conn->ctx);
-	dlog(LOG_DEBUG, "--->%d %d\n", errno, rc);
 	DIE (rc < 0, "io setup fail");
 	
 	conn->iocb = malloc(sizeof(struct iocb));
 	conn->piocb = malloc(sizeof(struct iocb*));
 	
-	DIE (conn->iocb == NULL, "malloc");
-	dlog(LOG_DEBUG, "HERE???\n");
+	DIE (conn->iocb == NULL || conn->piocb == NULL, "malloc");
 	return conn;
 }
 
@@ -157,6 +156,7 @@ static void connection_remove(struct connection *conn)
 	io_destroy(*conn->ctx);
 	free(conn->ctx);
 	conn->state = STATE_CONNECTION_CLOSED;
+	// remove it from the active connections array
 	for (int i = 0; i < active_cons; i++) {
 		if (conn == connections[i]) {
 			for (int j = i; j < active_cons - 1; j++) {
@@ -204,9 +204,12 @@ static void handle_new_connection(void)
 
 void parse_path_request(struct connection *conn)
 {
+	// prepare the settings for the parser
 	memset(&request_parser, 0, sizeof(request_parser));
 	http_parser_settings http_settings = settings_on_path;
 	http_parser_init(&request_parser, HTTP_REQUEST);
+
+	//execute the parsing
 	int rc = http_parser_execute(&request_parser, &http_settings, conn->recv_buffer, conn->recv_len);
 	DIE(rc < 0, "http parser request path");
 
@@ -226,6 +229,9 @@ static enum connection_state receive_message(struct connection *conn)
 		goto remove_connection;
 	}
 
+	// do the writing of request in the recv_buffer from the client socket of the connection 
+	// wget would generate input endlessly, so in order to avoid that, it should break after 
+	// \r\n\r\n
 	int aux = 0;
 	do {
 		aux += bytes_recv;
@@ -234,33 +240,28 @@ static enum connection_state receive_message(struct connection *conn)
 		bytes_recv = recv(conn->sockfd, conn->recv_buffer + aux, BUFSIZ - aux, 0);
 	} while (bytes_recv > 0);
 	bytes_recv = aux;
+
 	dlog(LOG_DEBUG, "RECEIVED message: %s\n", conn->recv_buffer);
 
 	if (bytes_recv < 0) {		/* error in communication */
 		dlog(LOG_ERR, "Error in communication from: %s\n", abuffer);
 		goto remove_connection;
 	}
-	// if (bytes_recv == 0) {		/* connection closed */
-		// dlog(LOG_INFO, "Connection closed from: %s\n", abuffer);
-		// fprintf(f_out, "Connection closed from: %s\n", abuffer);
-		// goto remove_connection;
-	// }
 
 	dlog(LOG_DEBUG, "Received message from: %s\n", abuffer);
 
 	conn->recv_len = bytes_recv;
 
-	// TODO handle http request-> extract path
+	// extract the path of the resource from the request
 	parse_path_request(conn);
-	dlog(LOG_DEBUG, "->>>>>: %s\n", conn->path_requested);
 
 	if (access(conn->path_requested, F_OK) == 0) {
 		conn->state = STATE_DATA_RECEIVED;
 		return STATE_DATA_RECEIVED;
 	}
-	dlog(LOG_DEBUG, "REMOVED connection file doesn't exist: %s\n", abuffer);
+	dlog(LOG_DEBUG, "REMOVED connection: file doesn't exist: %s\n", abuffer);
 
-	// file doesn't exist
+	// file doesn't exist, should give response properly and end connection
 	char reply[BUFSIZ] = "HTTP/1.0 404 ERROR\r\n\r\n";
 	int bytes_sent = 0;
 
@@ -287,6 +288,7 @@ remove_connection:
 
 static enum connection_state send_header(struct connection *conn)
 {
+	// the header that should be sent for both dynamic and static files
 	ssize_t bytes_sent = 0;
 	int rc;
 	char abuffer[64];
@@ -384,18 +386,25 @@ remove_connection:
 
 static enum connection_state send_message_event_sig(struct connection *conn)
 {
+	// function called only when eventfd of a connection has new data(the aio completed)
+	// and the event marked by epoll
 	dlog(LOG_DEBUG, "send message event sig\n");
 	// function called by eventfd, so it shouldn't block
 	struct io_event revent;
 	memset(&revent, 0, sizeof(struct io_event));
 
-	io_getevents(*conn->ctx, 1, 1, &revent, NULL);
-
+	// we can be sure of the fact that the function was called when data arrived in the userlevel buffer
+	// thus, we can safely put the timeout as 0
+	struct timespec timeout;
+	timeout.tv_nsec = 0;
+	timeout.tv_sec = 0;
+	int rc = io_getevents(*conn->ctx, 1, 1, &revent, &timeout);
+	DIE (rc < 0, "io getevents");
 	w_epoll_remove_fd(epollfd, conn->eventfd);
 
 	// clear the notification from epoll
 	uint64_t eventfd_msg;
-	int rc = read(conn->eventfd, &eventfd_msg, sizeof(uint64_t));
+	rc = read(conn->eventfd, &eventfd_msg, sizeof(uint64_t));
 	close(conn->eventfd);
 
 	ssize_t bytes_sent;
@@ -432,7 +441,6 @@ static enum connection_state send_message_event_sig(struct connection *conn)
 	if (conn->offset < conn->size) {
 		// it means the buffer went full before reading the full file
 		// put it to read the rest async and notify when ready
-		// dlog(LOG_DEBUG, "== BUFSIZ, get again get file in mem\n");
 		get_file_in_mem(conn);
 		return STATE_DATA_SENDING;
 	}
@@ -449,10 +457,11 @@ remove_connection:
 
 static enum connection_state send_message(struct connection *conn)
 {
+	// send the header for either types of file
 	if (send_header(conn) == STATE_CONNECTION_CLOSED)
 		return STATE_CONNECTION_CLOSED;
 	dlog(LOG_DEBUG, "Header sent\n");
-
+	// if the file is static, handle it with sendfile
 	if (conn->fileType == STATIC) {
 		return send_message_sendfile(conn);
 	}
@@ -481,11 +490,7 @@ enum fileType get_fileType(char *buffer)
 
 void get_file_in_mem(struct connection *conn)
 {
-	if (conn->aux_del == 50)
-		dlog(LOG_DEBUG, "THIS IS IT\n");
-
-	dlog(LOG_DEBUG, "get file in mem\n");
-	
+	// function that performs the reading from file in userlevel buffer, async
 	conn->eventfd = eventfd(0,0);
 	DIE(conn->eventfd < 0, "eventfd fail");
 	set_nonblocking(conn->eventfd);
@@ -504,19 +509,17 @@ void get_file_in_mem(struct connection *conn)
 	conn->piocb[0] = conn->iocb;
 
 	io_submit(*conn->ctx, 1, conn->piocb);
-	dlog(LOG_DEBUG, "CLOSE get file in mem\n");	
 }
 static void handle_client_request(struct connection *conn)
 {
+	// function called when a request from the client arrives
 	int rc;
 	enum connection_state ret_state;
 	ret_state = receive_message(conn);
 	if (ret_state == STATE_CONNECTION_CLOSED)
 		return;
 
-	/* add socket to epoll for out events */
 	conn->fileType = get_fileType(conn->path_requested);
-	dlog(LOG_DEBUG, "PATH = %s\n", conn->path_requested);
 
 	conn->file_fd = open(conn->path_requested, O_RDONLY);
 	DIE(conn->file_fd < 0, "open file");
@@ -525,12 +528,14 @@ static void handle_client_request(struct connection *conn)
 	fstat(conn->file_fd, &stat);
 	conn->size = stat.st_size;
 
+	// add socket to epoll for out events
 	rc = w_epoll_update_ptr_out(epollfd, conn->sockfd, conn);
 	DIE(rc < 0, "w_epoll_add_ptr_inout");
 
 }
 int handle_eventfd(struct epoll_event rev)
 {
+	// used to identify from which connection eventfd it came the revent in epoll
 	for (int i = 0; i < active_cons; i++) {
 		if (rev.data.fd > 0 && connections[i]->eventfd == rev.data.fd) {
 			dlog(LOG_DEBUG, "handle eventfd\n");

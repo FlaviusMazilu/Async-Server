@@ -32,4 +32,4 @@ all:
 	./run.sh
 
 zip:
-	zip FlavisMaziluTema3SO.zip -r aws.c http_parser.c sock_util.c README.md Makefile *.h
+	zip FlavisMaziluTema3SO.zip -r aws.c http_parser.c sock_util.c README.md Makefile *.h README.md
