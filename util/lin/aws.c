@@ -40,7 +40,6 @@ static struct connection *connections[100];
 static int active_cons = 0;
 void get_file_in_mem(struct connection *conn);
 
-FILE *f_out;
 
 /* server socket file descriptor */
 static int listenfd;
@@ -100,7 +99,6 @@ struct connection {
 	struct iocb *iocb;
 	struct iocb **piocb;
 	int file_fd;
-	int aux_del;
 	long long offset;
 	long long size;
 };
@@ -122,10 +120,9 @@ static struct connection *connection_create(int sockfd)
 
 	conn->ctx = NULL;
 	connections[active_cons++] = conn;
-	conn->aux_del = 0;
 	conn->offset = 0;
 	conn->ctx = malloc(sizeof(io_context_t));
-    int rc = io_setup(10, conn->ctx);
+    int rc = io_setup(3, conn->ctx);
 	dlog(LOG_DEBUG, "--->%d %d\n", errno, rc);
 	DIE (rc < 0, "io setup fail");
 	
@@ -207,6 +204,7 @@ static void handle_new_connection(void)
 
 void parse_path_request(struct connection *conn)
 {
+	memset(&request_parser, 0, sizeof(request_parser));
 	http_parser_settings http_settings = settings_on_path;
 	http_parser_init(&request_parser, HTTP_REQUEST);
 	int rc = http_parser_execute(&request_parser, &http_settings, conn->recv_buffer, conn->recv_len);
@@ -214,8 +212,6 @@ void parse_path_request(struct connection *conn)
 
 	memcpy(conn->path_requested, AWS_DOCUMENT_ROOT, strlen(AWS_DOCUMENT_ROOT));
 	memcpy(conn->path_requested + strlen(AWS_DOCUMENT_ROOT), request_path, strlen(request_path) + 1);
-	// fprintf(f_out, "path= %s\n", conn->path_requested);
-	fflush(f_out);
 }
 
 static enum connection_state receive_message(struct connection *conn)
@@ -229,20 +225,19 @@ static enum connection_state receive_message(struct connection *conn)
 		ERR("get_peer_address");
 		goto remove_connection;
 	}
+
 	int aux = 0;
-	// fprintf(f_out, "before recv\n");
 	do {
 		aux += bytes_recv;
 		if (strstr(conn->recv_buffer, "\r\n\r\n") != NULL)
 			break;
 		bytes_recv = recv(conn->sockfd, conn->recv_buffer + aux, BUFSIZ - aux, 0);
-		// fprintf(f_out, "->>>>>%s\n", conn->recv_buffer);
 	} while (bytes_recv > 0);
 	bytes_recv = aux;
-	// fprintf(f_out, "<<<<%ld\n", bytes_recv);
+	dlog(LOG_DEBUG, "RECEIVED message: %s\n", conn->recv_buffer);
+
 	if (bytes_recv < 0) {		/* error in communication */
 		dlog(LOG_ERR, "Error in communication from: %s\n", abuffer);
-		// fprintf(f_out, "Error in communication from: %s\n", abuffer);
 		goto remove_connection;
 	}
 	// if (bytes_recv == 0) {		/* connection closed */
@@ -252,20 +247,19 @@ static enum connection_state receive_message(struct connection *conn)
 	// }
 
 	dlog(LOG_DEBUG, "Received message from: %s\n", abuffer);
-	// fprintf(f_out, "Received message from: %s\n", abuffer);
-
-	// fprintf(f_out, "--\n%s--\n", conn->recv_buffer);
 
 	conn->recv_len = bytes_recv;
 
 	// TODO handle http request-> extract path
 	parse_path_request(conn);
+	dlog(LOG_DEBUG, "->>>>>: %s\n", conn->path_requested);
+
 	if (access(conn->path_requested, F_OK) == 0) {
-    	// file exists
-		// fprintf(f_out, "file exists\n");
 		conn->state = STATE_DATA_RECEIVED;
 		return STATE_DATA_RECEIVED;
 	}
+	dlog(LOG_DEBUG, "REMOVED connection file doesn't exist: %s\n", abuffer);
+
 	// file doesn't exist
 	char reply[BUFSIZ] = "HTTP/1.0 404 ERROR\r\n\r\n";
 	int bytes_sent = 0;
@@ -275,8 +269,6 @@ static enum connection_state receive_message(struct connection *conn)
 		aux += bytes_sent;
 		bytes_sent = send(conn->sockfd, reply + aux, strlen(reply) + 1, 0);
 	}while (bytes_sent > 0);
-
-	// fprintf(f_out, "file doesn't exist\n");
 
 remove_connection:
 	rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
@@ -292,19 +284,7 @@ remove_connection:
  * Send message on socket.
  * Store message in send_buffer in struct connection.
  */
-// http_parser http_reply;
-// void parse_http_response(struct connection *conn)
-// {
-// 	// request_parser
-// 	http_parser_init(&http_reply, HTTP_RESPONSE);
-// 	http_parser_settings settings;
-// 	http_parser_execute(&http_reply, &settings, NULL, NULL);
-	
-// }
-// static enum connection_state send_sendfile(struct connection *conn)
-// {
 
-// }
 static enum connection_state send_header(struct connection *conn)
 {
 	ssize_t bytes_sent = 0;
@@ -361,8 +341,6 @@ static enum connection_state send_message_sendfile(struct connection *conn)
 	DIE (fd < 0, "open");
 
 	fstat(fd, &stat);
-	fprintf(f_out, "conn->send_len = %ld\n", stat.st_size);
-	fflush(f_out);
 	int aux = 0;
 	off_t offset = 0;
 	bytes_sent = 0;
@@ -386,7 +364,6 @@ static enum connection_state send_message_sendfile(struct connection *conn)
 
 	dlog(LOG_DEBUG, "Sending message to %s\n", abuffer);
 
-	// printf("--\n%s--\n", conn->send_buffer);
 
 	/* all done - remove out notification */
 	close(fd);
@@ -428,7 +405,7 @@ static enum connection_state send_message_event_sig(struct connection *conn)
 		ERR("get_peer_address");
 		goto remove_connection;
 	}
-	// from here it has to be asyncron
+
 	int aux = 0;
 	bytes_sent = 0;
 	conn->send_len = revent.res;
@@ -449,23 +426,17 @@ static enum connection_state send_message_event_sig(struct connection *conn)
 
 	dlog(LOG_DEBUG, "Sending message to %s\n", abuffer);
 
-	// printf("--\n%s--\n", conn->send_buffer);
-	// dlog(LOG_DEBUG, "Sending messag%e of %lu BYTES\n", revent.res);
 	conn->offset += revent.res;
 	dlog(LOG_DEBUG, "BYTES = %ld OFFSET = %lld  SIZE = %lld\n", revent.res, conn->offset, conn->size);
 
 	if (conn->offset < conn->size) {
-	// 	// it means the buffer went full before reading the full file
-	// 	// put it to read the rest async and notify when ready
+		// it means the buffer went full before reading the full file
+		// put it to read the rest async and notify when ready
 		// dlog(LOG_DEBUG, "== BUFSIZ, get again get file in mem\n");
-		conn->aux_del = 50;
 		get_file_in_mem(conn);
 		return STATE_DATA_SENDING;
 	}
-		
-	/* all done - remove out notification */
-	// rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
-	// DIE(rc < 0, "w_epoll_update_ptr_in");
+	// the entire file has been sent		
 	connection_remove(conn);
 
 	return STATE_DATA_SENT;
@@ -488,8 +459,6 @@ static enum connection_state send_message(struct connection *conn)
 	if (conn->fileType == DYNAMIC) {
 		get_file_in_mem(conn);
 	}
-	// get_file_in_mem(conn);
-	// send_message_event_sig(conn);
 	int rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
 	DIE(rc < 0, "w_epoll_remove_ptr");
 
@@ -516,47 +485,26 @@ void get_file_in_mem(struct connection *conn)
 		dlog(LOG_DEBUG, "THIS IS IT\n");
 
 	dlog(LOG_DEBUG, "get file in mem\n");
+	
 	conn->eventfd = eventfd(0,0);
 	DIE(conn->eventfd < 0, "eventfd fail");
 	set_nonblocking(conn->eventfd);
 	dlog(LOG_DEBUG, "eventfd = %d\n", conn->eventfd);
 
 	w_epoll_add_fd_in(epollfd, conn->eventfd);
-	dlog(LOG_DEBUG, "HERE?\n");
-	
-	dlog(LOG_DEBUG, "HERE??\n");
-
-	// int bytes = read(fd, conn->send_buffer, BUFSIZ);
-	// struct iocb 
-	// io_prep_pread()
-	// DIE(bytes < 0, "eroare de comunicare");
-	dlog(LOG_DEBUG, "HERE1\n");
 
 	struct stat stat;
 	fstat(conn->file_fd, &stat);
 	conn->send_len = stat.st_size;
 
-	dlog(LOG_DEBUG, "HERE2\n");
 
 	io_prep_pread(conn->iocb, conn->file_fd, conn->send_buffer, BUFSIZ, conn->offset);
 	io_set_eventfd(conn->iocb, conn->eventfd);
 
 	conn->piocb[0] = conn->iocb;
-	dlog(LOG_DEBUG, "HERE3\n");
 
-	// w_epoll_add_fd_in(epollfd, conn->eventfd);
 	io_submit(*conn->ctx, 1, conn->piocb);
-	// struct io_event revent;
-	// io_getevents(conn->ctx, 1, 1, &revent, NULL);
-	//TODO CLOSE fd, event and all
-	dlog(LOG_DEBUG, "CLOSE get file in mem\n");
-	// if (conn->aux_del == 50) {
-		// struct io_event revent;
-		// io_getevents(*conn->ctx, 1, 1, &revent, NULL);
-		// dlog(LOG_DEBUG, "AFTER io_getevents\n");
-
-	// }
-	
+	dlog(LOG_DEBUG, "CLOSE get file in mem\n");	
 }
 static void handle_client_request(struct connection *conn)
 {
@@ -567,15 +515,16 @@ static void handle_client_request(struct connection *conn)
 		return;
 
 	/* add socket to epoll for out events */
-	// conn->send_buffer, move here
 	conn->fileType = get_fileType(conn->path_requested);
+	dlog(LOG_DEBUG, "PATH = %s\n", conn->path_requested);
+
 	conn->file_fd = open(conn->path_requested, O_RDONLY);
 	DIE(conn->file_fd < 0, "open file");
 	set_nonblocking(conn->file_fd);
 	struct stat stat;
 	fstat(conn->file_fd, &stat);
 	conn->size = stat.st_size;
-	// connection_copy_buffers(conn);
+
 	rc = w_epoll_update_ptr_out(epollfd, conn->sockfd, conn);
 	DIE(rc < 0, "w_epoll_add_ptr_inout");
 
@@ -593,17 +542,6 @@ int handle_eventfd(struct epoll_event rev)
 }
 int main(void)
 {
-	int rc;
-	f_out = fopen("plswork.txt", "a");
-	if (f_out != NULL)
-		printf("aici NU e problema\n");
-	DIE(f_out == NULL, "fopen");
-
-	// char buffer[100];
-	// getcwd(buffer, sizeof(buffer));
-	// fprintf(f_out, "%s\n", buffer);
-	// fflush(f_out);
-	/* init multiplexing */
 	epollfd = w_epoll_create();
 	DIE(epollfd < 0, "w_epoll_create");
 
@@ -612,7 +550,7 @@ int main(void)
 		DEFAULT_LISTEN_BACKLOG);
 	DIE(listenfd < 0, "tcp_create_listener");
 
-	rc = w_epoll_add_fd_in(epollfd, listenfd);
+	int	rc = w_epoll_add_fd_in(epollfd, listenfd);
 	DIE(rc < 0, "w_epoll_add_fd_in");
 
 	dlog(LOG_INFO, "Server waiting for connections on port %d\n",
@@ -633,15 +571,11 @@ int main(void)
 
 		if (rev.data.fd == listenfd) {
 			dlog(LOG_DEBUG, "New connection\n");
-			// fprintf(f_out, "new connection\n");
-			// fflush(f_out);
 			if (rev.events & EPOLLIN)
 				handle_new_connection();
 		} else {
 			if (rev.events & EPOLLIN) {
 				dlog(LOG_DEBUG, "New EPOLLIN\n");
-				// fprintf(f_out, "new message\n");
-				// fflush(f_out);
 				int ok = handle_eventfd(rev);
 				if (ok == 1)
 					continue;
@@ -650,13 +584,9 @@ int main(void)
 			}
 			if (rev.events & EPOLLOUT) {
 				dlog(LOG_DEBUG, "Ready to send message\n");
-				// fprintf(f_out, "ready to send message\n");
-				// fflush(f_out);
 				send_message(rev.data.ptr);
-				// fprintf(f_out, "message sent\n");
 			}
 		}
 	}
-	fclose(f_out);
 	return 0;
 }

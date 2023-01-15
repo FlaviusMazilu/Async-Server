@@ -1,3 +1,0 @@
-
-#define BUFFER_FULL 69
-#define BUFFER_NOT_FULL 68
